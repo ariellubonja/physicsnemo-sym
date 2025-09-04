@@ -19,12 +19,12 @@ import matplotlib.pyplot as plt
 import torch
 
 try:
-    import pyJHTDB
-    import pyJHTDB.dbinfo
+    from givernylocal.turbulence_dataset import turb_dataset
+    from givernylocal.turbulence_toolkit import getData
 except:
     raise ModuleNotFoundError(
-        "This example requires the pyJHTDB python package for access to the JHT database.\n"
-        + "Find out information here: https://github.com/idies/pyJHTDB"
+        "This example requires the giverny python package for access to the JHT database.\n"
+        + "Find out information here: https://github.com/sciserver/giverny"
     )
 from tqdm import *
 from typing import List
@@ -74,18 +74,43 @@ def _name_to_pos(name):
 
 
 def get_jhtdb(
-    loader, data_dir: Path, dataset, field, time_step, start, end, step, filter_width
+    loader, data_dir: Path, dataset, field, time_step, start, end, step, filter_width, domain_size
 ):
+    # Set Dataset params. See https://turbulence.idies.jhu.edu/docs/isotropic/README-isotropic.pdf
+    subfield = 0 # u-component of u-v-w of Velocity
+    temporal_method = 'none'
+    spatial_method = 'none'
+    spatial_operator = 'field'
+    physical_domain_size = 2 * np.pi
+    # Physical Domain size. 
+    dx = domain_size / 1024
+    # Physical Time between each snapshot. Can be found in the README file of each dataset
+    #    e.g. https://turbulence.idies.jhu.edu/docs/isotropic/README-isotropic.pdf
+    dt = .002
+
+    subfield = "u"  # 0-th component of velocity, which is a vector of [u,v,w]
+    subfield_idx = 0
+
     # get filename
     file_name = (
-        _pos_to_name(dataset, field, time_step, start, end, step, filter_width) + ".npy"
+        _pos_to_name(dataset, subfield, time_step, start, end, step, filter_width) + ".npy"
     )
     file_dir = data_dir / Path(file_name)
 
     # check if file exists and if not download it
     try:
         results = np.load(file_dir)
-    except:
+
+        results2 = getData(
+            dataset,
+            field=field,
+            time_step=time_step,
+            start=start,
+            end=end,
+            step=step,
+            filter_width=filter_width,
+        )
+    except FileNotFoundError:
         # Only MPI process 0 can download data
         if DistributedManager().rank == 0:
             results = loader.getCutout(
@@ -120,29 +145,31 @@ def make_jhtdb_dataset(
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # initialize runner
-    lJHTDB = pyJHTDB.libJHTDB()
-    lJHTDB.initialize()
-    lJHTDB.add_token(token)
+    dataset = "isotropic1024coarse"
+
+    # initialize JHTDB dataset
+    turbulence_dataset = turb_dataset(
+        dataset_title=dataset,
+        output_path = str(data_dir),
+        auth_token = token
+    )
 
     # loop to get dataset
     np.random.seed(dataset_seed)
     list_low_res_u = []
     list_high_res_u = []
     for i in tqdm(range(nr_samples)):
-        # set download params
-        dataset = "isotropic1024coarse"
-        field = "u"
+        field = "velocity"
         time_step = int(np.random.randint(time_range[0], time_range[1]))
+
         start = np.array(
             [np.random.randint(1, 1024 - domain_size) for _ in range(3)], dtype=int
         )
         end = np.array([x + domain_size - 1 for x in start], dtype=int)
-        np.array(3 * [1], dtype=int)
 
         # get high res data
         high_res_u = get_jhtdb(
-            lJHTDB,
+            turbulence_dataset,
             data_dir,
             dataset,
             field,
@@ -151,11 +178,12 @@ def make_jhtdb_dataset(
             end,
             np.array(3 * [1], dtype=int),
             1,
+            domain_size
         )
 
         # get low res data
         low_res_u = get_jhtdb(
-            lJHTDB,
+            turbulence_dataset,
             data_dir,
             dataset,
             field,
@@ -164,6 +192,7 @@ def make_jhtdb_dataset(
             end,
             np.array(3 * [lr_factor], dtype=int),
             lr_factor,
+            domain_size
         )
 
         # plot
