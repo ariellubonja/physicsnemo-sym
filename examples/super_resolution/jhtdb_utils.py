@@ -83,7 +83,7 @@ def get_jhtdb(
     spatial_operator = 'field'
     physical_domain_size = 2 * np.pi
     # Physical Domain size. 
-    dx = domain_size / 1024
+    dx = dy = dz = physical_domain_size / 1024
     # Physical Time between each snapshot. Can be found in the README file of each dataset
     #    e.g. https://turbulence.idies.jhu.edu/docs/isotropic/README-isotropic.pdf
     dt = .002
@@ -97,19 +97,37 @@ def get_jhtdb(
     )
     file_dir = data_dir / Path(file_name)
 
+    nx = ny = nz = domain_size
+
+    x_points = np.linspace(0 * dx, (nx-1) * dx, nx, dtype=np.float64)
+    y_points = np.linspace(0 * dy, (ny-1) * dy, ny, dtype=np.float64)
+    z_points = np.linspace(0 * dz, (nz-1) * dz, nz, dtype=np.float64)
+
+    points = np.array(
+        [axis.ravel() for axis in np.meshgrid(x_points, y_points, z_points, indexing = 'ij')],
+        dtype = np.float64).T
+    
+    physical_time_step = time_step * dt
+
     # check if file exists and if not download it
     try:
         results = np.load(file_dir)
 
-        results2 = getData(
-            dataset,
-            field=field,
-            time_step=time_step,
-            start=start,
-            end=end,
-            step=step,
-            filter_width=filter_width,
-        )
+        # getData is limited to 2,000,000 points. Bigger queries need to be broken down
+        # TODO Shard queries for other domain sizes
+        if domain_size == 128:
+            results2 = getData(
+                loader,
+                field,
+                physical_time_step,
+                temporal_method,
+                spatial_method,
+                spatial_operator,
+                np.expand_dims(points[:,0], axis=1)
+            )
+
+        assert np.array_equal(results, results2)
+
     except FileNotFoundError:
         # Only MPI process 0 can download data
         if DistributedManager().rank == 0:
@@ -159,7 +177,7 @@ def make_jhtdb_dataset(
     list_low_res_u = []
     list_high_res_u = []
     for i in tqdm(range(nr_samples)):
-        field = "velocity"
+        field = "pressure"
         time_step = int(np.random.randint(time_range[0], time_range[1]))
 
         start = np.array(
