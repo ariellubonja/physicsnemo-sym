@@ -175,22 +175,17 @@ def get_jhtdb(
     nx = ny = nz = domain_size
 
     # getData is now 0-indexed, unlike previous getCutout. Keep this after file_name
-    start -= 1
-    end -= 1
-    time_step -= 1
-
     # TODO check Step logic
     # TODO removing 64 from end to maintain step size of 1, and access only 64 points. Only for testing [:64]
-    end -= 64
-    x_points = np.linspace(start[0] * dx, end[0] * dx * step[0], nx, dtype=np.float64)
-    y_points = np.linspace(start[1] * dy, end[1] * dy * step[1], ny, dtype=np.float64)
-    z_points = np.linspace(start[2] * dz, end[2] * dz * step[2], nz, dtype=np.float64)
+    x_points = np.linspace((start[0]-1) * dx, (end[0]-1-64) * dx * step[0], nx, dtype=np.float64)
+    y_points = np.linspace((start[1]-1) * dy, (end[1]-1-64) * dy * step[1], ny, dtype=np.float64)
+    z_points = np.linspace((start[2]-1) * dz, (end[2]-1-64) * dz * step[2], nz, dtype=np.float64)
 
     points = np.array(
         [axis.ravel() for axis in np.meshgrid(x_points, y_points, z_points, indexing = 'ij')],
         dtype = np.float64).T
     
-    physical_time_step = time_step * dt
+    physical_time_step = (time_step-1) * dt
 
     # check if file exists and if not download it
     try:
