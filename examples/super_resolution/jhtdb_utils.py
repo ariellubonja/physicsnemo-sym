@@ -73,16 +73,92 @@ def _name_to_pos(name):
     return field, time_step, start, end, step, filter_width
 
 
+def _download_sharded_volume(
+    loader,
+    file_dir: Path,
+    field: str,
+    physical_time_step: float,
+    nx: int,
+    ny: int,
+    nz: int,
+    dx: float,
+    dy: float,
+    dz: float,
+    subfield_size,
+    subfield_idx: int = 0,
+    temporal_method: str = "none",
+    spatial_method: str  = "none",
+    spatial_operator: str = "field"
+):
+    """
+    Break down big query into smaller getData calls to stay withing 2m point limit.
+    Only rank 0 executes the download; afterwards the array is saved on
+    disk so the other ranks can reload it.
+    """
+    MAX_POINTS = 2_000_000
+    # --- decide sub-cube size -------------------------------------------------
+    # maximum linear size that stays within the point limit
+    sub_n = int(MAX_POINTS ** (1 / 3))          # ~126 for 2e6
+    sub_n = max(1, sub_n)                       # safety
+    sub_n = min(sub_n, nx, ny, nz)
+    # round sub_n to power of two so that 128 -> 64
+    while sub_n & (sub_n - 1):
+        sub_n -= 1                              # 125 → 124 → … → 64
+
+    results = np.empty((nx, ny, nz), dtype=np.float32)
+
+    # loop over blocks----------------------------------------------------------
+    for i0 in range(0, nx, sub_n):
+        i1 = min(i0 + sub_n, nx)
+        x_sub = np.linspace(i0 * dx, (i1 - 1) * dx, i1 - i0, dtype=np.float64)
+
+        for j0 in range(0, ny, sub_n):
+            j1 = min(j0 + sub_n, ny)
+            y_sub = np.linspace(j0 * dy, (j1 - 1) * dy, j1 - j0, dtype=np.float64)
+
+            for k0 in range(0, nz, sub_n):
+                k1 = min(k0 + sub_n, nz)
+                z_sub = np.linspace(k0 * dz, (k1 - 1) * dz, k1 - k0, dtype=np.float64)
+
+                # build point list for this block
+                pts = np.array(
+                    [axis.ravel() for axis in np.meshgrid(x_sub, y_sub, z_sub, indexing='ij')],
+                    dtype=np.float64
+                ).T
+
+                block = getData(
+                    loader,
+                    field,
+                    physical_time_step,
+                    temporal_method,
+                    spatial_method,
+                    spatial_operator,
+                    pts
+                )
+                block = np.array(block[0]).reshape(len(x_sub), len(y_sub), len(z_sub), subfield_size)
+                # Swap z-y-x axis order from getData into x-y-z from original getCutout method
+                block = block.transpose(2,1,0,3) # 4th dimension - the variable "depth" should stay where it is
+                desired_var = block[:,:,:,subfield_idx]
+                results[i0:i1, j0:j1, k0:k1] = desired_var
+
+    # TODO save once everything is in memory
+    # np.save(file_dir, results)
+    return results
+
+
 def get_jhtdb(
     loader, data_dir: Path, dataset, field, time_step, start, end, step, filter_width, domain_size
 ):
+    domain_size = 64 # TODO remove this
     # Set Dataset params. See https://turbulence.idies.jhu.edu/docs/isotropic/README-isotropic.pdf
     subfield = 0 # u-component of u-v-w of Velocity
     temporal_method = 'none'
     spatial_method = 'none'
     spatial_operator = 'field'
     physical_domain_size = 2 * np.pi
-    # Physical Domain size. 
+    # Scalar fields have depth 3. Velocity is a vector field of depth 3
+    subfield_size = 3 if field == "velocity" else 1
+    # Physical Domain steps between measured points
     dx = dy = dz = physical_domain_size / 1024
     # Physical Time between each snapshot. Can be found in the README file of each dataset
     #    e.g. https://turbulence.idies.jhu.edu/docs/isotropic/README-isotropic.pdf
@@ -91,7 +167,6 @@ def get_jhtdb(
     subfield = "u"  # 0-th component of velocity, which is a vector of [u,v,w]
     subfield_idx = 0
 
-    # get filename
     file_name = (
         _pos_to_name(dataset, subfield, time_step, start, end, step, filter_width) + ".npy"
     )
@@ -99,9 +174,17 @@ def get_jhtdb(
 
     nx = ny = nz = domain_size
 
-    x_points = np.linspace(0 * dx, (nx-1) * dx, nx, dtype=np.float64)
-    y_points = np.linspace(0 * dy, (ny-1) * dy, ny, dtype=np.float64)
-    z_points = np.linspace(0 * dz, (nz-1) * dz, nz, dtype=np.float64)
+    # getData is now 0-indexed, unlike previous getCutout. Keep this after file_name
+    start -= 1
+    end -= 1
+    time_step -= 1
+
+    # TODO check Step logic
+    # TODO removing 64 from end to maintain step size of 1, and access only 64 points. Only for testing [:64]
+    end -= 64
+    x_points = np.linspace(start[0] * dx, end[0] * dx * step[0], nx, dtype=np.float64)
+    y_points = np.linspace(start[1] * dy, end[1] * dy * step[1], ny, dtype=np.float64)
+    z_points = np.linspace(start[2] * dz, end[2] * dz * step[2], nz, dtype=np.float64)
 
     points = np.array(
         [axis.ravel() for axis in np.meshgrid(x_points, y_points, z_points, indexing = 'ij')],
@@ -115,18 +198,33 @@ def get_jhtdb(
 
         # getData is limited to 2,000,000 points. Bigger queries need to be broken down
         # TODO Shard queries for other domain sizes
-        if domain_size == 128:
-            results2 = getData(
-                loader,
-                field,
-                physical_time_step,
-                temporal_method,
-                spatial_method,
-                spatial_operator,
-                np.expand_dims(points[:,0], axis=1)
-            )
+        # results_sharded = _download_sharded_volume(
+        #     loader,
+        #     file_dir,
+        #     field,
+        #     physical_time_step,
+        #     nx, ny, nz,
+        #     dx, dy, dz,
+        #     subfield_size,
+        #     subfield_idx = subfield_idx,
+        # )
 
-        assert np.array_equal(results, results2)
+        r2 = getData(
+            loader,
+            field,
+            physical_time_step,
+            temporal_method,
+            spatial_method,
+            spatial_operator,
+            points
+        )
+
+        res2 = np.array(r2[0]).reshape(nx, ny, nz, subfield_size)
+        # Swap z-y-x axis order from getData into x-y-z from original getCutout method
+        results2 = res2.transpose(2,1,0,3) # 4th dimension - the variable "depth" should stay where it is
+        # results2 = res2[:,:,:,subfield_idx] # nvidia seems to have saved all 3 u-v-w
+
+        assert np.array_equal(results[:64,:64,:64,:], results2)
 
     except FileNotFoundError:
         # Only MPI process 0 can download data
@@ -177,7 +275,7 @@ def make_jhtdb_dataset(
     list_low_res_u = []
     list_high_res_u = []
     for i in tqdm(range(nr_samples)):
-        field = "pressure"
+        field = "velocity"
         time_step = int(np.random.randint(time_range[0], time_range[1]))
 
         start = np.array(
