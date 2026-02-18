@@ -16,6 +16,13 @@
 
 __version__ = "2.4.0a0"
 
+# Provide no-op NVTX stubs when CUDA is not available so profiling
+# annotations throughout the codebase don't crash on CPU-only systems.
+import torch
+if not torch.cuda.is_available():
+    torch.cuda.nvtx.range_push = lambda msg: None  # type: ignore[assignment]
+    torch.cuda.nvtx.range_pop = lambda: None  # type: ignore[assignment]
+
 from pint import UnitRegistry
 
 from .node import Node
