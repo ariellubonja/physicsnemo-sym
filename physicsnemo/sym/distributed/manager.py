@@ -289,8 +289,9 @@ class DistributedManager(object):
         manager._initialization_method = method
 
         # Set device for this process and empty cache to optimize memory usage
-        torch.cuda.device(manager.device)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.device(manager.device)
+            torch.cuda.empty_cache()
 
     @staticmethod
     def create_process_subgroup(name: str, size: int, group_name=None, verbose=False):
