@@ -20,6 +20,75 @@ import numpy as np
 
 from typing import List, Dict, Union
 
+# Monkey-patch SRResNet to allow any power-of-2 scaling factor (not just 2, 4, 8).
+# The architecture already handles arbitrary powers of 2 via log2(N) sub-pixel blocks.
+import physicsnemo.models.srrn.super_res_net as _srn
+import math
+from physicsnemo.models.srrn.super_res_net import (
+    ConvolutionalBlock3d,
+    ResidualConvBlock3d,
+    SubPixel_ConvolutionalBlock3d,
+    MetaData,
+)
+from physicsnemo.models.layers import get_activation
+from torch import nn
+
+_orig_init = _srn.SRResNet.__init__
+
+
+def _patched_init(
+    self,
+    in_channels,
+    out_channels,
+    large_kernel_size=7,
+    small_kernel_size=3,
+    conv_layer_size=32,
+    n_resid_blocks=8,
+    scaling_factor=8,
+    activation_fn="prelu",
+):
+    # Replicate __init__ but with relaxed scaling_factor validation
+    _srn.Module.__init__(self, meta=MetaData())
+    self.var_dim = 1
+
+    if isinstance(activation_fn, str):
+        activation_fn = get_activation(activation_fn)
+
+    scaling_factor = int(scaling_factor)
+    if scaling_factor < 2 or (scaling_factor & (scaling_factor - 1)) != 0:
+        raise ValueError("The scaling factor must be a power of 2, >= 2!")
+
+    self.conv_block1 = ConvolutionalBlock3d(
+        in_channels=in_channels, out_channels=conv_layer_size,
+        kernel_size=large_kernel_size, batch_norm=False, activation_fn=activation_fn,
+    )
+    self.residual_blocks = nn.Sequential(*[
+        ResidualConvBlock3d(
+            n_layers=2, kernel_size=small_kernel_size,
+            conv_layer_size=conv_layer_size, activation_fn=activation_fn,
+        )
+        for _ in range(n_resid_blocks)
+    ])
+    self.conv_block2 = ConvolutionalBlock3d(
+        in_channels=conv_layer_size, out_channels=conv_layer_size,
+        kernel_size=small_kernel_size, batch_norm=True,
+    )
+    n_subpixel_convolution_blocks = int(math.log2(scaling_factor))
+    self.subpixel_convolutional_blocks = nn.Sequential(*[
+        SubPixel_ConvolutionalBlock3d(
+            kernel_size=small_kernel_size, conv_layer_size=conv_layer_size,
+            scaling_factor=2,
+        )
+        for _ in range(n_subpixel_convolution_blocks)
+    ])
+    self.conv_block3 = ConvolutionalBlock3d(
+        in_channels=conv_layer_size, out_channels=out_channels,
+        kernel_size=large_kernel_size, batch_norm=False,
+    )
+
+
+_srn.SRResNet.__init__ = _patched_init
+
 import physicsnemo.sym
 from physicsnemo.sym.hydra import to_absolute_path, instantiate_arch
 
