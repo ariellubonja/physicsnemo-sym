@@ -35,6 +35,10 @@ from torch import nn
 
 _orig_init = _srn.SRResNet.__init__
 
+# Module-level config for refinement layers between sub-pixel stages.
+# Set from cfg.custom.n_refine_per_stage before model creation.
+_N_REFINE_PER_STAGE = 0
+
 
 def _patched_init(
     self,
@@ -74,13 +78,22 @@ def _patched_init(
         kernel_size=small_kernel_size, batch_norm=True,
     )
     n_subpixel_convolution_blocks = int(math.log2(scaling_factor))
-    self.subpixel_convolutional_blocks = nn.Sequential(*[
-        SubPixel_ConvolutionalBlock3d(
+    n_refine = _N_REFINE_PER_STAGE
+    modules = []
+    for i in range(n_subpixel_convolution_blocks):
+        modules.append(SubPixel_ConvolutionalBlock3d(
             kernel_size=small_kernel_size, conv_layer_size=conv_layer_size,
             scaling_factor=2,
-        )
-        for _ in range(n_subpixel_convolution_blocks)
-    ])
+        ))
+        # Add refinement Conv+BN+PReLU layers between (not after last) sub-pixel stages
+        if n_refine > 0 and i < n_subpixel_convolution_blocks - 1:
+            for _ in range(n_refine):
+                modules.append(ConvolutionalBlock3d(
+                    in_channels=conv_layer_size, out_channels=conv_layer_size,
+                    kernel_size=small_kernel_size, batch_norm=True,
+                    activation_fn=nn.PReLU(),
+                ))
+    self.subpixel_convolutional_blocks = nn.Sequential(*modules)
     self.conv_block3 = ConvolutionalBlock3d(
         in_channels=conv_layer_size, out_channels=out_channels,
         kernel_size=large_kernel_size, batch_norm=False,
@@ -369,6 +382,9 @@ class SuperResolutionValidator(GridValidator):
 
 @physicsnemo.sym.main(config_path="conf", config_name="config")
 def run(cfg: PhysicsNeMoConfig) -> None:
+    global _N_REFINE_PER_STAGE
+    _N_REFINE_PER_STAGE = cfg.custom.get("n_refine_per_stage", 0)
+
     # load jhtdb datasets
     invar, outvar = make_jhtdb_dataset(
         nr_samples=cfg.custom.jhtdb.n_train,

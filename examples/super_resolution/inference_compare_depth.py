@@ -47,6 +47,9 @@ from physicsnemo.models.srrn.super_res_net import (
 from physicsnemo.models.layers import get_activation
 
 
+_N_REFINE_PER_STAGE = 0
+
+
 def _patched_init(
     self,
     in_channels,
@@ -90,16 +93,24 @@ def _patched_init(
         batch_norm=True,
     )
     n_subpixel_convolution_blocks = int(math.log2(scaling_factor))
-    self.subpixel_convolutional_blocks = nn.Sequential(
-        *[
-            SubPixel_ConvolutionalBlock3d(
-                kernel_size=small_kernel_size,
-                conv_layer_size=conv_layer_size,
-                scaling_factor=2,
-            )
-            for _ in range(n_subpixel_convolution_blocks)
-        ]
-    )
+    n_refine = _N_REFINE_PER_STAGE
+    modules = []
+    for i in range(n_subpixel_convolution_blocks):
+        modules.append(SubPixel_ConvolutionalBlock3d(
+            kernel_size=small_kernel_size,
+            conv_layer_size=conv_layer_size,
+            scaling_factor=2,
+        ))
+        if n_refine > 0 and i < n_subpixel_convolution_blocks - 1:
+            for _ in range(n_refine):
+                modules.append(ConvolutionalBlock3d(
+                    in_channels=conv_layer_size,
+                    out_channels=conv_layer_size,
+                    kernel_size=small_kernel_size,
+                    batch_norm=True,
+                    activation_fn=nn.PReLU(),
+                ))
+    self.subpixel_convolutional_blocks = nn.Sequential(*modules)
     self.conv_block3 = ConvolutionalBlock3d(
         in_channels=conv_layer_size,
         out_channels=out_channels,
@@ -113,6 +124,8 @@ _srn.SRResNet.__init__ = _patched_init
 register_amp_configs()
 
 # --- Experiment definitions ---
+# Each experiment can specify "n_refine_per_stage" (default 0) to set the
+# refinement layer count before model construction.
 experiments = [
     {
         "label": "0 blocks",
@@ -159,6 +172,18 @@ experiments = [
         ],
         "ckpt_dir": "./outputs/arch.super_res.n_resid_blocks=24,arch.super_res.scaling_factor=8/super_resolution/",
     },
+    {
+        "label": "refine=1",
+        "n_refine_per_stage": 1,
+        "overrides": ["arch.super_res.scaling_factor=8"],
+        "ckpt_dir": "./outputs/arch.super_res.scaling_factor=8,custom.n_refine_per_stage=1,training.max_steps=5000/super_resolution/",
+    },
+    {
+        "label": "refine=2",
+        "n_refine_per_stage": 2,
+        "overrides": ["arch.super_res.scaling_factor=8"],
+        "ckpt_dir": "./outputs/arch.super_res.scaling_factor=8,custom.n_refine_per_stage=2,training.max_steps=5000/super_resolution/",
+    },
 ]
 
 # --- Load data ---
@@ -193,6 +218,7 @@ U_pred = {}
 
 for exp in experiments:
     label = exp["label"]
+    _N_REFINE_PER_STAGE = exp.get("n_refine_per_stage", 0)
     cfg = compose(
         config_path="conf",
         config_name="config",
