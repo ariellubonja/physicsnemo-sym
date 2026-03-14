@@ -14,12 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate scree plots (loss vs training step) from TensorBoard logs for
-super-resolution models trained at different scaling factors."""
+"""Generate scree plots (loss vs training step) from TensorBoard logs.
+
+Supports two modes:
+  --mode scaling   Compare models across scaling factors (4x, 8x, 16x, 32x)
+  --mode depth     Compare 8x models across residual block counts (0, 2, 4, 8, 16, 24)
+"""
 
 import argparse
 import glob
 import os
+import re
 import sys
 
 import matplotlib.pyplot as plt
@@ -27,118 +32,88 @@ import numpy as np
 from tensorboard.backend.event_processing import event_accumulator
 
 
-def read_tensorboard_events(path):
-    """Read TensorBoard event files and return dict of {tag: {step, value}}."""
-    event_files = glob.glob(os.path.join(path, "*events*"))
-    assert event_files, f"No event files found in {path}"
-
+def read_loss(run_dir):
+    """Read Train/loss_aggregated from TensorBoard events in run_dir."""
+    event_files = glob.glob(os.path.join(run_dir, "**", "*events*"), recursive=True)
+    if not event_files:
+        return None, None
     ea = event_accumulator.EventAccumulator(
         event_files[0],
         size_guidance={event_accumulator.TENSORS: 0},
     )
     ea.Reload()
-    tags = ea.Tags()["tensors"]
+    tag = "Train/loss_aggregated"
+    if tag not in ea.Tags()["tensors"]:
+        return None, None
+    events = ea.Tensors(tag)
+    steps = np.array([e.step for e in events])
+    values = np.array([e.tensor_proto.float_val[0] for e in events])
+    return steps, values
 
-    data = {}
-    for tag in tags:
-        if tag == "config/text_summary":
+
+def find_runs_by_scaling(output_dir):
+    """Auto-detect runs by scaling factor. Returns list of (label, run_dir)."""
+    runs = []
+    # Default 4x run (no scaling_factor override in dir name)
+    default_dir = os.path.join(output_dir, "super_resolution")
+    if os.path.isdir(default_dir):
+        runs.append(("4x", default_dir))
+    for d in sorted(os.listdir(output_dir)):
+        m = re.match(r"^arch\.super_res\.scaling_factor=(\d+)$", d)
+        if m:
+            sf = int(m.group(1))
+            run_dir = os.path.join(output_dir, d, "super_resolution")
+            if os.path.isdir(run_dir):
+                runs.append((f"{sf}x", run_dir))
+    return runs
+
+
+def find_runs_by_depth(output_dir):
+    """Auto-detect 8x runs with different n_resid_blocks. Returns list of (label, run_dir).
+    When multiple runs exist for the same block count, pick the one with the most event data."""
+    candidates = {}  # n_blocks -> list of run_dirs
+    for d in sorted(os.listdir(output_dir)):
+        # Default 8x baseline (n_resid_blocks=8, no override in dir name)
+        if d == "arch.super_res.scaling_factor=8":
+            run_dir = os.path.join(output_dir, d, "super_resolution")
+            if os.path.isdir(run_dir):
+                candidates.setdefault(8, []).append(run_dir)
             continue
-        events = ea.Tensors(tag)
-        steps = np.array([e.step for e in events])
-        values = np.array([e.tensor_proto.float_val[0] for e in events])
-        data[tag] = {"step": steps, "value": values}
-    return data
-
-
-def find_events_dir(base_output_dir, scaling_factor):
-    """Locate the TensorBoard events directory for a given scaling factor."""
-    run_dir = os.path.join(
-        base_output_dir,
-        f"arch.super_res.scaling_factor={scaling_factor}",
-        "super_resolution",
-    )
-    if not os.path.isdir(run_dir):
-        return None
-    # Events are typically in a subdirectory or directly in run_dir
-    # Search recursively for event files
-    event_files = glob.glob(os.path.join(run_dir, "**", "*events*"), recursive=True)
-    if not event_files:
-        return None
-    # Return the directory containing the first event file
-    return os.path.dirname(event_files[0]) + "/"
-
-
-def plot_single_model(data, scaling_factor, save_dir):
-    """Plot loss curves for a single model."""
-    os.makedirs(save_dir, exist_ok=True)
-
-    keys = list(data.keys())
-    train_loss_keys = [k for k in keys if "Train" in k and "loss" in k.lower()]
-    val_keys = [k for k in keys if "Validators" in k or "Valid" in k]
-    plot_keys = train_loss_keys + val_keys
-
-    if not plot_keys:
-        # Fallback: plot all keys except learning rate
-        plot_keys = [k for k in keys if "learning_rate" not in k]
-
-    fig, axs = plt.subplots(len(plot_keys), 1, figsize=(8, 4 * len(plot_keys)))
-    if len(plot_keys) == 1:
-        axs = [axs]
-
-    for i, key in enumerate(plot_keys):
-        axs[i].plot(data[key]["step"], data[key]["value"], linewidth=1)
-        axs[i].set_yscale("log")
-        axs[i].set_xlabel("Training Step")
-        axs[i].set_ylabel("Loss")
-        axs[i].set_title(f"{key} ({scaling_factor}x)")
-        axs[i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(save_dir, f"scree_{scaling_factor}x.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"Saved {save_path}")
-
-
-def plot_combined(all_data, save_dir):
-    """Plot combined comparison of Train/loss_aggregated across scaling factors."""
-    os.makedirs(save_dir, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for sf, data in sorted(all_data.items()):
-        loss_key = "Train/loss_aggregated"
-        if loss_key not in data:
-            # Try to find any loss key
-            loss_key = next((k for k in data if "loss" in k.lower()), None)
-        if loss_key is None:
-            print(f"  Warning: no loss key found for {sf}x, skipping")
-            continue
-        ax.plot(data[loss_key]["step"], data[loss_key]["value"],
-                label=f"{sf}x", linewidth=1.5)
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Training Step")
-    ax.set_ylabel("Loss (log scale)")
-    ax.set_title("Training Loss Comparison Across Scaling Factors")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(save_dir, "scree_combined.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"Saved {save_path}")
+        # Runs with explicit n_resid_blocks override and scaling_factor=8
+        m_blocks = re.search(r"n_resid_blocks=(\d+)", d)
+        m_sf = re.search(r"scaling_factor=8", d)
+        if m_blocks and m_sf:
+            n_blocks = int(m_blocks.group(1))
+            run_dir = os.path.join(output_dir, d, "super_resolution")
+            if os.path.isdir(run_dir):
+                candidates.setdefault(n_blocks, []).append(run_dir)
+    # For each block count, pick the run with the most event data
+    runs = []
+    for n_blocks in sorted(candidates):
+        best_dir = None
+        best_count = -1
+        for run_dir in candidates[n_blocks]:
+            event_files = glob.glob(os.path.join(run_dir, "**", "*events*"), recursive=True)
+            count = len(event_files)
+            # Use file size as tiebreaker (more training = bigger event file)
+            size = sum(os.path.getsize(f) for f in event_files) if event_files else 0
+            if size > best_count:
+                best_count = size
+                best_dir = run_dir
+        if best_dir:
+            runs.append((f"{n_blocks} blocks", best_dir))
+    return runs
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate scree plots from SR training logs")
     parser.add_argument(
-        "--output-dir", default="outputs",
-        help="Base output directory containing run subdirectories (default: outputs)",
+        "--mode", choices=["scaling", "depth"], default="scaling",
+        help="Compare across scaling factors or across depth (default: scaling)",
     )
     parser.add_argument(
-        "--scaling-factors", nargs="+", type=int, default=None,
-        help="Scaling factors to plot (default: auto-detect from output dir)",
+        "--output-dir", default="outputs",
+        help="Base output directory (default: outputs)",
     )
     parser.add_argument(
         "--save-dir", default="scree_plots",
@@ -146,40 +121,42 @@ def main():
     )
     args = parser.parse_args()
 
-    # Auto-detect scaling factors if not specified
-    if args.scaling_factors is None:
-        args.scaling_factors = []
-        if os.path.isdir(args.output_dir):
-            for d in os.listdir(args.output_dir):
-                if d.startswith("arch.super_res.scaling_factor="):
-                    try:
-                        sf = int(d.split("=")[1])
-                        args.scaling_factors.append(sf)
-                    except ValueError:
-                        pass
-        args.scaling_factors.sort()
+    if args.mode == "scaling":
+        runs = find_runs_by_scaling(args.output_dir)
+        title = "Training Loss Comparison Across Scaling Factors"
+        filename = "scree_combined.png"
+    else:
+        runs = find_runs_by_depth(args.output_dir)
+        title = "Training Loss: 8x SR Depth Comparison"
+        filename = "scree_depth.png"
 
-    if not args.scaling_factors:
-        print("No scaling factors found. Check --output-dir or specify --scaling-factors.")
+    if not runs:
+        print(f"No runs found in {args.output_dir} for mode={args.mode}")
         sys.exit(1)
 
-    print(f"Scaling factors: {args.scaling_factors}")
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    all_data = {}
-    for sf in args.scaling_factors:
-        events_dir = find_events_dir(args.output_dir, sf)
-        if events_dir is None:
-            print(f"  No events found for {sf}x, skipping")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for label, run_dir in runs:
+        steps, values = read_loss(run_dir)
+        if steps is None:
+            print(f"  No events for {label}, skipping")
             continue
-        print(f"  Reading {sf}x from {events_dir}")
-        data = read_tensorboard_events(events_dir)
-        all_data[sf] = data
-        plot_single_model(data, sf, args.save_dir)
+        ax.plot(steps, values, linewidth=1.5, label=label)
+        print(f"  {label}: {len(steps)} points, final loss = {values[-1]:.4f}")
 
-    if len(all_data) > 1:
-        plot_combined(all_data, args.save_dir)
+    ax.set_yscale("log")
+    ax.set_xlabel("Training Step")
+    ax.set_ylabel("Loss (log scale)")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-    print("Done!")
+    plt.tight_layout()
+    save_path = os.path.join(args.save_dir, filename)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"Saved {save_path}")
 
 
 if __name__ == "__main__":
